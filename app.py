@@ -1,31 +1,61 @@
-from openai import OpenAI
 import streamlit as st
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain.schema import StrOutputParser
-from langchain.schema.runnable import RunnablePassthrough
 
-import os
-import time
+from langchain.schema import StrOutputParser
+from langchain_core.runnables import  RunnablePassthrough
+from langchain.schema.runnable import RunnableMap
+from operator import itemgetter
+from langchain_openai import ChatOpenAI
+from langchain.prompts import PromptTemplate
 import dotenv
+import os
 dotenv.load_dotenv()
 
-embeddings = OpenAIEmbeddings()
+
+from langchain_chroma import Chroma
+from langchain.storage import InMemoryStore
+from langchain.retrievers import ParentDocumentRetriever
+from langchain_community.embeddings.sentence_transformer import SentenceTransformerEmbeddings
+
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 
-llm = ChatOpenAI(model_name="gpt-4o-mini", temperature=0)
+# create the open-source embedding function
+embedding_function = SentenceTransformerEmbeddings(model_name="all-MiniLM-L6-v2")
+# =============================================================================
+# ===========================Store Document====================================
 
-def format_docs(docs):
-    return f"\n\n".join(f'{i+1}. ' + doc.page_content.strip("\n") + f"<ARXIV_ID> {doc.metadata['arxiv_id']} <ARXIV_ID/>" for i, doc in enumerate(docs))
+import chromadb
+
+persistent_client = chromadb.PersistentClient(path="database")
+collection = persistent_client.get_or_create_collection("arxiv_papers")
+
+child_vectorstore = Chroma(
+    client=persistent_client,
+    embedding_function=embedding_function
+)
+
+# # The storage layer for the parent documents
+parent_docstore = InMemoryStore()
+
+child_splitter  = RecursiveCharacterTextSplitter(chunk_size=200, chunk_overlap=20)
+retriever = ParentDocumentRetriever(
+    vectorstore=child_vectorstore, 
+    docstore=parent_docstore,
+    child_splitter=child_splitter)
 
 
-from langchain.prompts import PromptTemplate
 
 
 
-template = """
+openai_api_key=os.getenv("OPENAI_API_KEY")
+os.environ["LANGCHAIN_TRACING_V2"] = "true"
+
+llm = ChatOpenAI(model_name="gpt-4o-mini")
+
+system_prompt  = """
 You are an expert on the STAR experiment, a high-energy nuclear physics experiment at the Relativistic Heavy Ion Collider (RHIC) at Brookhaven National Laboratory. \
 Your task is to answer questions specifically related to the STAR experiment, its findings, technologies, and related topics.  \
- Refrain any other topics by saying you will not answer questions about them and Exit right away here. DO NOT PROCEED. \
+Refrain any other topics by saying you will not answer questions about them and Exit right away here. DO NOT PROCEED. \
 You are not allowed to use any other sources other than the provided search results. \
 
 Generate a comprehensive, and informative answer strictly within 200 words or less for the \
@@ -36,36 +66,33 @@ repeat text. You should use bullet points in your answer for readability. Make s
 You should not hallicunate nor build up any references, Use only the `context` html block below and do not use any text within <ARXIV_ID> and </ARXIV_ID> except when citing in the end. 
 Make sure not to repeat the same context. Be specific to the exact question asked for.\
 
-
 Here is the response template:
 ---
 # Response template 
 
-- Start with a greeting and a summary of the user's query
 - Use bullet points to list the main points or facts that answer the query using the information within the tags <context> and <context/>.  
 - After answering, analyze the respective source links provided within <ARXIV_ID> and </ARXIV_ID> and keep only the unique links for the next step. Try to minimize the total number of unique links with no more than 10 unique links for the answer.
 - You will strictly use no more than 10 most unique links for the answer.
-- Use bulleted list of superscript numbers within square brackets to cite the sources for each point or fact. The numbers should correspond to the order of the sources which will be provided in the end of this reponse. Note that for every source, you must provide a URL.
-- End with a closing remark and a list of sources with their respective URLs as a bullet list explicitly with full links which are enclosed in the tag <ARXIV_ID> and </ARXIV_ID> respectively.\
+- Use bulleted list of superscript numbers within square brackets to cite the sources for each point or fact. The numbers should correspond to the order of the sources which will be provided in the end of this reponse. Note that for every source, you must provide a URL and pages from where it is taken.
+- End with a closing remark and a list of sources with their respective URLs and relevant pages as a bullet list explicitly with full links which are enclosed in the tag <ARXIV_ID> and </ARXIV_ID> respectively.\
 ---
 Here is how an response would look like. Reproduce the same format for your response:
 ---
 # Example response
 
-Hello, thank you for your question about the STAR experiment. Here are some key points about STAR:
+Hello, here are some key points:
 
 - The STAR (Solenoidal Tracker at RHIC) experiment is a major high-energy nuclear physics experiment conducted at the Relativistic Heavy Ion Collider (RHIC) at Brookhaven National Laboratory[^1^]
 - The primary research goal of STAR is to study the properties of the quark-gluon plasma (QGP), a state of matter thought to have existed just after the Big Bang, by colliding heavy ions at nearly the speed of light[^2^]
 - STAR utilizes a variety of advanced detectors to measure the thousands of particles produced in these collisions, including the Time Projection Chamber (TPC), the Barrel Electromagnetic Calorimeter (BEMC), and the Muon Telescope Detector (MTD)[^3^]
 - Key findings from STAR include evidence for the QGP's near-perfect fluidity, the discovery of the "chiral magnetic effect," and insights into the spin structure of protons[^4^]
 
-I hope this helps you understand more about the STAR experiment.
 Sources
 
-    [^1^][1]: https://arxiv.org/abs/nucl-ex/0005004
-    [^2^][2]: https://arxiv.org/abs/nucl-ex/0106003
-    [^3^][3]: https://arxiv.org/abs/nucl-ex/0501009
-    [^4^][4]: https://arxiv.org/abs/nucl-ex/0603028
+    [^1^][1]: https://arxiv.org/abs/nucl-ex/0005004, p. 3
+    [^2^][2]: https://arxiv.org/abs/nucl-ex/0106003, p. 5-7
+    [^3^][3]: https://arxiv.org/abs/nucl-ex/0501009, p. 1
+    [^4^][4]: https://arxiv.org/abs/nucl-ex/0603028, p. 4
 
 ---
 
@@ -95,53 +122,48 @@ user.\
 Question: {question}
 """
 
+def format_docs(docs):
+    return f"\n\n".join(f'{i+1}. ' + doc.page_content.strip("\n") 
+                        + f"<ARXIV_ID> {doc.metadata['arxiv_id']} <ARXIV_ID/>" 
+                        for i, doc in enumerate(docs))
 
-rag_prompt_custom = PromptTemplate.from_template(template)
-
-from langchain.schema.runnable import RunnableMap
+system_template = PromptTemplate.from_template(system_prompt)
 
 rag_chain_from_docs = (
     {
         "context": lambda input: format_docs(input["documents"]),
         "question": itemgetter("question"),
     }
-    | rag_prompt_custom
+    | system_template
     | llm
     | StrOutputParser()
 )
+
+
 rag_chain_with_source = RunnableMap(
     {"documents": retriever, "question": RunnablePassthrough()}
 ) | {
     "answer": rag_chain_from_docs,
 }
 
-st.title("STAR chat")
+# Streamlit app layout
+st.title('STAR chat')
 
-st.sidebar.title("Data Collection")
 
-if "openai_model" not in st.session_state:
-    st.session_state["openai_model"] = "gpt-4o-mini"
+# User input
+user_input = st.text_input('Enter your input:', '')
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+# Display output from LangChain
+if st.button('Generate Response'):
+    if user_input:
+        response = rag_chain_with_source.run(user_input)  # Adjust this if your chain uses a different method
+        st.write('Response:')
+        st.write(response)
+    else:
+        st.write('Please enter some input to get a response.')
 
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+# Additional configurations and settings can be added here
 
-if prompt := st.chat_input("What is up?"):
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
-
-    with st.chat_message("assistant"):
-        full_response = ""
-        allchunks = None
-        with st.spinner("Gathering info from Knowledge Bank and writing response..."):
-            allchunks = rag_chain_with_source.stream(prompt)
-            message_placeholder = st.empty()
-            for chunk in allchunks:
-                full_response += (chunk.get("answer") or "")
-                message_placeholder.markdown(full_response + "▌")
-            message_placeholder.markdown(full_response)
-    st.session_state.messages.append({"role": "assistant", "content": full_response})
+if __name__ == "__main__":
+    # Run the Streamlit app
+    st.run()

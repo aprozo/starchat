@@ -4,3 +4,4 @@
 __pycache__/
 database/*
 arxiv_papers/*
+streamlit/secrets.toml

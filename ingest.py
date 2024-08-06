@@ -1,83 +1,107 @@
-import fitz  # PyMuPDF
 import os
 import arxiv
-from sentence_transformers import SentenceTransformer
+
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from tqdm import tqdm
+from langchain_community.document_loaders import PyPDFLoader
 
-def extract_text_and_metadata_from_pdfs(folder_path):
-    data = []
-    for filename in tqdm(os.listdir(folder_path)):
-        if filename.endswith(".pdf"):
-            doc = fitz.open(os.path.join(folder_path, filename))
-            arxiv_id = filename.split("/")[-1].split(".pdf")[0]
-            search = arxiv.Search(id_list=[arxiv_id])
-            paper  = next(arxiv.Client().results(search))
-            
-            if paper:
-                arxiv_metadata = {
-                    "title": paper.title,
-                    "categories" : '\n'.join([f'{i+1}. {cat}' for i, cat in enumerate(paper.categories)]),
-                    "primary_category": paper.primary_category,
-                    "published": paper.published.strftime('%Y-%m-%d'),
-                    "authors": '\n'.join([f'{i+1}. {auth.name}' for i, auth in enumerate(paper.authors)])
-                }
-            else:
-                arxiv_metadata = {
-                    "title": doc.metadata.get("title", "Unknown"),
-                    "categories": "Unknown",
-                    "primary_category": "Unknown",
-                    "published": doc.metadata.get("creationDate", "Unknown"),
-                    "authors": doc.metadata.get("author", "Unknown")
-                }
-
-            print (arxiv_metadata)
+from langchain_chroma import Chroma
+from langchain.storage import InMemoryStore
+from langchain.retrievers import ParentDocumentRetriever
+from langchain_community.embeddings.sentence_transformer import SentenceTransformerEmbeddings
 
 
-            full_text = ""
-            for page in doc:
-                full_text += page.get_text()
-                
-            text_splitter = RecursiveCharacterTextSplitter(chunk_size=200, chunk_overlap=20)
-            chunks = text_splitter.split_text(full_text)
-            
-            for i, chunk in enumerate(chunks):
-                data.append({
-                    "id": f"{arxiv_id}_{i}",
-                    "text": chunk,
-                    "metadata": {
-                        **arxiv_metadata,
-                        "filename": filename,
-                        "chunk_id": i
-                    }
-                })
-    return data
+class Document:
+    def __init__(self, content, metadata=None):
+        self.page_content = content
+        self.metadata = metadata if metadata is not None else {}
 
-data = extract_text_and_metadata_from_pdfs("test_docs")
-texts = [item['text'] for item in data]
-metadata_list = [item['metadata'] for item in data]
-ids = [item['id'] for item in data]
+# =============================================================================
+# ===========================Read PDFs=========================================
+
+def getArxivPaper(name):
+     print (f"Searching for the paper with ID: {name}")
+     if len(name) == 7:
+          name = "nucl-ex/" + name
+     try:
+          search = arxiv.Search( id_list=[name] )
+          paper = next(arxiv.Client().results(search))
+          return paper
+     
+     except StopIteration:
+          print(f"No results found for the ID: {name}")
+
+     # if length of name is 7, then it is an old arxiv id , add prefix nucl-ex or hep-ex if nucl-ex was not found
+
+     if name.startswith("nucl-ex/"):
+          name = name.replace("nucl-ex/","hep-ex/")
+          return getArxivPaper(name)
+     
+     return None
+
+def getDocument(filename):
+    base_filename = filename.split("/")[-1].split(".pdf")[0]
+    # if arxiv_id does not have a dot, add nucl-ex/ in front of it
+    paper = getArxivPaper(base_filename)
+    text_metadata = {
+        "title": paper.title,
+        "published": paper.published.strftime('%Y-%m-%d'),
+        "authors": '\n'.join([f'{i+1}. {auth.name}' for i, auth in enumerate(paper.authors)])
+    }
+
+    text_metadata["arxiv_id"] = paper.get_short_id()
+
+    loader = PyPDFLoader(filename)
+    pages = loader.load_and_split()
+    full_text = ""
+    page_number = 1
+    for page in pages:
+        full_text += f"\n PAGE {page_number}\n"
+        full_text += page.page_content
+        page_number += 1
+        
+    document= Document(content=full_text, metadata=text_metadata) 
+    print (f"Document {base_filename} has been loaded")
+    return document
 
 
-model = SentenceTransformer('all-MiniLM-L6-v2')
 
-embeddings = model.encode(texts, show_progress_bar=True)
+
+
+# create the open-source embedding function
+embedding_function = SentenceTransformerEmbeddings(model_name="all-MiniLM-L6-v2")
+# =============================================================================
+# ===========================Store Document====================================
 
 import chromadb
-client = chromadb.Client()
 
-collection = client.get_or_create_collection(name="pdfs")
+persistent_client = chromadb.PersistentClient(path="database")
+collection = persistent_client.get_or_create_collection("arxiv_papers")
 
-collection.add(
-    ids=ids,
-    documents =texts,
-    embeddings=embeddings,
-    metadatas =metadata_list
+child_vectorstore = Chroma(
+    client=persistent_client,
+    embedding_function=embedding_function
 )
 
-results = collection.query(
-    query_texts=["What are artcile categories?"],
-    n_results=2
-)
+# # The storage layer for the parent documents
+parent_docstore = InMemoryStore()
 
-results
+child_splitter  = RecursiveCharacterTextSplitter(chunk_size=200, chunk_overlap=20)
+retriever = ParentDocumentRetriever(
+    vectorstore=child_vectorstore, 
+    docstore=parent_docstore,
+    child_splitter=child_splitter)
+
+
+
+folder_path="arxiv_papers"
+for filename in tqdm(os.listdir(folder_path)):
+    if not filename.endswith(".pdf"):
+        continue
+    filename = os.path.join(folder_path, filename)
+    print (f"Loading {filename}")
+    print 
+    document = getDocument(filename)
+    retriever.add_documents([document])
+# =============================================================================
+# ===========================Split Document====================================
